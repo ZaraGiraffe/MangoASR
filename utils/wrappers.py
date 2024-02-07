@@ -24,6 +24,6 @@ class WhisperAsrWrapperModel(torch.nn.Module):
         )
         return {
             "loss": model_output.loss,
-            "logits": model_output.logits,
+            "predictions": torch.argmax(model_output.logits, dim=2),
             "labels": labels,
         }
