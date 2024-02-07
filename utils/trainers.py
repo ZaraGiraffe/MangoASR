@@ -1,3 +1,9 @@
+"""
+The code is copied from here
+https://github.com/anakib1/MangoDemo/blob/master/mango/training/MangoTrainer.py
+The code is slightly changed for compatability purposes
+"""
+
 import pathlib
 
 import numpy as np

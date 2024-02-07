@@ -28,6 +28,12 @@ class WhisperEvalGenerator:
 
 @dataclass
 class WhisperTrainCollator:
+    """
+    Collator function class, see __call__ method to analise the structure of the dataset
+    that can be used with this collator
+    :param processor: usual whisper processor
+    :param device: this parameter determines where to put the output tensors
+    """
     processor: WhisperProcessor
     device: str = "cpu"
 
