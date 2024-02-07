@@ -1,9 +1,3 @@
-"""
-The code is copied from here
-https://github.com/anakib1/MangoDemo/blob/master/mango/training/MangoTrainer.py
-The code is slightly changed for compatability purposes
-"""
-
 import pathlib
 
 import numpy as np
@@ -48,7 +42,9 @@ class TrainerConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-3
     scheduler_strategy: str = 'batch'
-    hf_user: str = "Zarakun"
+    early_stopping_patience: int = None
+    hf_user: str = 'Zarakun'
+    gradient_accumulation_steps: int = 1
 
 
 class MangoTrainer:
@@ -75,9 +71,12 @@ class MangoTrainer:
         self.eval_loader = eval_loader
         self.project_dir = pathlib.Path('output').joinpath(self.config.model_name)
         if accelerator is None:
+            plugin = accelerate.utils.GradientAccumulationPlugin(num_steps=self.config.gradient_accumulation_steps,
+                                                                 sync_with_dataloader=False)
             accelerator = accelerate.Accelerator(log_with='tensorboard',
                                                  project_dir=self.project_dir,
-                                                 mixed_precision=self.config.mixed_precision)
+                                                 mixed_precision=self.config.mixed_precision,
+                                                 gradient_accumulation_plugin=plugin)
         self.accelerator = accelerator
         if optimizer is None:
             optimizer = torch.optim.AdamW(model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
@@ -87,11 +86,12 @@ class MangoTrainer:
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer=self.optimizer, last_epoch=-1)
         self.scheduler = scheduler
 
-        self.model, self.optimizer, self.scheduler, self.train_loader, self.eval_loader = accelerator.prepare(self.model,
-                                                                                              self.optimizer,
-                                                                                              self.scheduler,
-                                                                                              self.train_loader,
-                                                                                              self.eval_loader)
+        self.model, self.optimizer, self.scheduler, self.train_loader, self.eval_loader = accelerator.prepare(
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.train_loader,
+            self.eval_loader)
         self.api = HfApi()
         self.global_train_step = 0
         self.global_eval_step = 0
@@ -121,10 +121,19 @@ class MangoTrainer:
             hps.update(self.hparams)
             self.accelerator.init_trackers(run_name, config=hps)
 
+        train_losses = []
+
         for epoch in range(num_epochs):
             self.epoch = epoch
 
             train_outputs = self.train_iteration(epoch)
+
+            train_losses.append(np.mean(train_outputs.losses))
+            if self.config.early_stopping_patience is not None:
+                if len(train_losses) > self.config.early_stopping_patience and np.min(train_losses[:-self.config.early_stopping_patience]) < np.min(train_losses[-self.config.early_stopping_patience:]):
+                    logger.info(f"Stopping training at epoch {epoch}. Early stopping criterion reached")
+                    self.accelerator.set_trigger()
+
             self.accelerator.wait_for_everyone()
             if self.config.scheduler_strategy == 'epoch':
                 self.scheduler.step()
@@ -143,6 +152,9 @@ class MangoTrainer:
 
             logger.info(f'Epoch {epoch} passed')
 
+            if self.accelerator.check_trigger():
+                break
+
         if self.config.save_strategy == 'end':
             self.save_model()
 
@@ -152,16 +164,12 @@ class MangoTrainer:
         if not self.accelerator.is_main_process:
             return
         try:
-            pathlib.Path(self.project_dir).mkdir(parents=True, exist_ok=True)
+            pathlib.Path(self.run_dir).mkdir(parents=True, exist_ok=True)
             unwrapped_model = self.accelerator.unwrap_model(self.model)
             torch.save(unwrapped_model.state_dict(), f'{self.run_dir}/model.pt')
 
             if self.config.push_to_hub:
-###################################################################################
-                # repo_id = f'anakib1/{self.config.model_name}'             # original
-###################################################################################
-                repo_id = f'{self.config.hf_user}/{self.config.model_name}' # zara change
-###################################################################################
+                repo_id = f'{self.config.hf_user}/{self.config.model_name}'
                 if not self.api.repo_exists(repo_id):
                     self.api.create_repo(repo_id, repo_type='model')
                 self.api.upload_folder(
@@ -179,7 +187,7 @@ class MangoTrainer:
             if self.config.use_tensorboard:
                 for k, v in results.items():
                     self.accelerator.log({f'{k}/{iteration_class}': v}, outputs.epoch_id)
-                self.accelerator.log({f'lr/{iteration_class}' : self.scheduler.get_last_lr()[0]}, outputs.epoch_id)
+                self.accelerator.log({f'lr/{iteration_class}': self.scheduler.get_last_lr()[0]}, outputs.epoch_id)
         except Exception as ex:
             logger.error(f"Logging failed. Exception: {ex}")
 
@@ -200,15 +208,14 @@ class MangoTrainer:
             if len(v[0].shape) == 0:
                 ret[k] = torch.tensor(v)
             else:
-###################################################################################
-                # ret[k] = torch.concatenate(v)     # original
-###################################################################################
-                ret[k] = self.concatenate(v)        # zaras change
-###################################################################################
+############################################################################################
+                # ret[k] = torch.concatenate(v)                     # my edited code
+                ret[k] = self.concatenate(v)
+############################################################################################
         return ret
 
-###################################################################################
-                                                    # my added function
+############################################################################################
+                                                                    # my edited code
     def concatenate(self, mas: list[torch.Tensor]) -> torch.Tensor:
         """
         This function concatenates the list of tensors by first dimension
@@ -226,7 +233,7 @@ class MangoTrainer:
             padded_mas.append(padded_arr)
         return torch.concatenate(padded_mas, dim=0)
 
-###################################################################################
+############################################################################################
 
     def train_iteration(self, epoch_index: int) -> TrainingOutput:
         """
@@ -240,20 +247,21 @@ class MangoTrainer:
         losses = []
 
         for i, batch in enumerate(self.train_loader):
-            self.optimizer.zero_grad()
-            output = self.model(**batch)
-            if 'loss' not in output:
-                raise Exception("Model 'forward' function did not return 'loss' as expected. ")
-            loss = output['loss']
+            with self.accelerator.accumulate(self.model):
+                self.optimizer.zero_grad()
+                output = self.model(**batch)
+                if 'loss' not in output:
+                    raise Exception("Model 'forward' function did not return 'loss' as expected. ")
+                loss = output['loss']
 
-            self.accelerator.backward(loss)
+                self.accelerator.backward(loss)
 
-            self.optimizer.step()
-            if self.config.scheduler_strategy == 'batch':
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
-                    self.scheduler.step(self.epoch + i / len(self.train_loader))
-                else:
-                    self.scheduler.step()
+                self.optimizer.step()
+                if self.config.scheduler_strategy == 'batch':
+                    if isinstance(self.scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
+                        self.scheduler.step(self.epoch + i / len(self.train_loader))
+                    else:
+                        self.scheduler.step()
 
             for k, v in output.items():
                 if k not in train_outputs:
