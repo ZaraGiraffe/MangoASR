@@ -6,7 +6,7 @@ from transformers import WhisperForConditionalGeneration
 @dataclass
 class WhisperAsrWrapperConfig:
     version: int = 1
-    pad_token_id = 50257
+    pad_token_id: int = -100
 
 
 class WhisperAsrWrapperModel(torch.nn.Module):

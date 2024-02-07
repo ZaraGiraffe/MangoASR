@@ -36,6 +36,7 @@ class WhisperTrainCollator:
     """
     processor: WhisperProcessor
     device: str = "cpu"
+    pad_token_id: int = -100
 
     def __call__(self, raw_data: list[dict]) -> dict:
         """
@@ -51,7 +52,7 @@ class WhisperTrainCollator:
         tokens_dict = self.processor.tokenizer([exm["transcription"] for exm in raw_data])
         max_length = max(list(map(lambda x: len(x), tokens_dict["input_ids"])))
         tokens_dict = {
-            "input_ids": [v + [-100] * (max_length - len(v)) for v in tokens_dict["input_ids"]],
+            "input_ids": [v + [self.pad_token_id] * (max_length - len(v)) for v in tokens_dict["input_ids"]],
             "attention_mask": [v + [0] * (max_length - len(v)) for v in tokens_dict["attention_mask"]],
         }
         model_input = {
